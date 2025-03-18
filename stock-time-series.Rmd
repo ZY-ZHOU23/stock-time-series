@@ -1,0 +1,171 @@
+---
+title: "Stock Forecasting Project"
+output: pdf_document
+---
+
+# Libraries
+```{r message=FALSE}
+library(tidyverse)
+library(lubridate)
+library(quantmod)
+library(tseries)
+library(forecast)
+```
+
+# Data Gathering 
+## User Inputs (Stock and Date)
+```{r}
+symbol <- "AAPL"
+start_date <- as.Date("2018-01-01")
+end_date <- Sys.Date()
+```
+
+## Stock Data Collection
+```{r}
+getSymbols(symbol, 
+           src  = "yahoo", 
+           from = start_date, 
+           to   = end_date,
+           auto.assign = TRUE)
+
+stock_data <- get(symbol)
+
+head(stock_data)
+```
+
+# Data Exploration & Feature Engineering
+## EDA
+```{r}
+# Convert time-series data (xts object) to a regular tibble
+df_stock <- tibble(
+  date     = index(stock_data),
+  open     = as.numeric(stock_data[, paste0(symbol, ".Open")]),
+  high     = as.numeric(stock_data[, paste0(symbol, ".High")]),
+  low      = as.numeric(stock_data[, paste0(symbol, ".Low")]),
+  close    = as.numeric(stock_data[, paste0(symbol, ".Close")]),
+  volume   = as.numeric(stock_data[, paste0(symbol, ".Volume")]),
+  adjusted = as.numeric(stock_data[, paste0(symbol, ".Adjusted")])
+)
+
+glimpse(df_stock)
+summary(df_stock)
+
+# Plot Adjusted Closing Price over time with a dynamic title
+ggplot(df_stock, aes(x = date, y = adjusted)) +
+  geom_line() +
+  labs(title = paste(symbol, "Adjusted Closing Price"),
+       x = "Date",
+       y = "Adjusted Price") +
+  theme_minimal()
+
+```
+
+```{r}
+# Check if there is any NA (rare to have NA)
+df_stock %>%
+  summarize(across(everything(), ~ sum(is.na(.)))) 
+```
+
+## Feature Engineering
+### Add new variables
+```{r}
+# Calculate Bollinger Bands using high, low, and close
+bb <- BBands(HLC = df_stock %>% select(high, low, close),
+             n = 20, maType = "SMA", sd = 2)
+
+# Calculate MACD based on the adjusted closing price
+macd_values <- MACD(df_stock$adjusted, nFast = 12, nSlow = 26, nSig = 9)
+
+# Add all new variables
+df_stock <- df_stock %>%
+  arrange(date) %>%
+  mutate(
+    daily_return = (adjusted - lag(adjusted)) / lag(adjusted) * 100,
+    lag1_close = lag(adjusted, 1),
+    lag2_close = lag(adjusted, 2),
+    ma20 = rollmean(adjusted, k = 20, fill = NA, align = "right"),
+    ma50 = rollmean(adjusted, k = 50, fill = NA, align = "right"),
+    rsi14 = RSI(adjusted, n = 14),
+    bb_dn   = bb[, "dn"],
+    bb_mavg = bb[, "mavg"],
+    bb_up   = bb[, "up"],
+    bb_pctB = bb[, "pctB"],
+    macd    = macd_values[, "macd"],
+    macdSig = macd_values[, "signal"],
+    rolling_sd_20 = rollapply(daily_return, width = 20, 
+                              FUN = sd, fill = NA, align = "right"),
+    wday = wday(date, label = TRUE),
+    sin_wday = sin(2 * pi * wday(date) / 7),
+    cos_wday = cos(2 * pi * wday(date) / 7)
+  )
+
+```
+
+### Visualize new variables
+```{r warning=FALSE}
+# Plot 14-Day RSI
+ggplot(df_stock, aes(x = date, y = rsi14)) +
+  geom_line() +
+  labs(title = "14-Day RSI", x = "Date", y = "RSI") +
+  theme_minimal()
+
+# Plot Adjusted Price vs. Moving Averages using dynamic title
+df_stock_long <- df_stock %>%
+  select(date, adjusted, ma20, ma50) %>%
+  pivot_longer(cols = c("adjusted", "ma20", "ma50"), 
+               names_to = "variable", values_to = "value")
+
+ggplot(df_stock_long, aes(x = date, y = value, color = variable)) +
+  geom_line() +
+  labs(title = paste(symbol, "Adjusted Price vs MAs"),
+       x = "Date", y = "Value", color = "Series") +
+  theme_minimal()
+
+```
+
+```{r warning=FALSE}
+# Plot Bollinger Bands with the closing price
+ggplot(df_stock, aes(x = date)) +
+  geom_line(aes(y = close), color = "blue") +
+  geom_line(aes(y = bb_dn), color = "red", linetype = "dashed") +
+  geom_line(aes(y = bb_up), color = "red", linetype = "dashed") +
+  labs(title = "Bollinger Bands", y = "Price") +
+  theme_minimal()
+
+```
+
+```{r warning=FALSE}
+# Plot 20-day Rolling Std Dev of Daily Returns
+ggplot(df_stock, aes(x = date, y = rolling_sd_20)) +
+  geom_line() +
+  labs(title = "20-day Rolling Std Dev of Daily Returns",
+       x = "Date", y = "Rolling SD (%)") +
+  theme_minimal()
+
+```
+
+### Other tests and analysis
+```{r}
+# Correlation Matrix of Numeric Features
+df_numerics <- df_stock %>%
+  select(where(is.numeric)) %>%
+  drop_na()  # Remove rows with NA for accurate correlation
+
+GGally::ggcorr(df_numerics, 
+               method = c("pairwise.complete.obs", "pearson"),
+               label  = TRUE) +
+  ggtitle("Correlation Matrix of Numeric Features")
+
+```
+
+```{r}
+# Stationarity Tests: Adjusted Price and Daily Returns
+adf_result <- adf.test(df_stock$adjusted, alternative = "stationary")
+print(adf_result)
+
+adf_returns <- adf.test(na.omit(df_stock$daily_return), alternative = "stationary")
+print(adf_returns)
+
+```
+
+#  Model 1: ARIMA with Exogenous Regressors (ARIMAX)
