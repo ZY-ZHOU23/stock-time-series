@@ -1,9 +1,13 @@
 ---
 title: "Stock Forecasting Project"
-output: pdf_document
+output: 
+  pdf_document:
+    toc: true
 ---
 
+\newpage
 # Libraries
+
 ```{r message=FALSE}
 library(tidyverse)
 library(lubridate)
@@ -12,15 +16,18 @@ library(tseries)
 library(forecast)
 ```
 
-# Data Gathering 
+# Data Gathering
+
 ## User Inputs (Stock and Date)
+
 ```{r}
 symbol <- "AAPL"
-start_date <- as.Date("2018-01-01")
+start_date <- as.Date("2022-01-01")
 end_date <- Sys.Date()
 ```
 
 ## Stock Data Collection
+
 ```{r}
 getSymbols(symbol, 
            src  = "yahoo", 
@@ -30,11 +37,13 @@ getSymbols(symbol,
 
 stock_data <- get(symbol)
 
-head(stock_data)
+# head(stock_data)
 ```
 
 # Data Exploration & Feature Engineering
+
 ## EDA
+
 ```{r}
 # Convert time-series data (xts object) to a regular tibble
 df_stock <- tibble(
@@ -67,7 +76,9 @@ df_stock %>%
 ```
 
 ## Feature Engineering
+
 ### Add new variables
+
 ```{r}
 # Calculate Bollinger Bands using high, low, and close
 bb <- BBands(HLC = df_stock %>% select(high, low, close),
@@ -102,14 +113,15 @@ df_stock <- df_stock %>%
 ```
 
 ### Visualize new variables
+
 ```{r warning=FALSE}
-# Plot 14-Day RSI
+# 14-Day RSI
 ggplot(df_stock, aes(x = date, y = rsi14)) +
   geom_line() +
   labs(title = "14-Day RSI", x = "Date", y = "RSI") +
   theme_minimal()
 
-# Plot Adjusted Price vs. Moving Averages using dynamic title
+# MAs
 df_stock_long <- df_stock %>%
   select(date, adjusted, ma20, ma50) %>%
   pivot_longer(cols = c("adjusted", "ma20", "ma50"), 
@@ -121,10 +133,7 @@ ggplot(df_stock_long, aes(x = date, y = value, color = variable)) +
        x = "Date", y = "Value", color = "Series") +
   theme_minimal()
 
-```
-
-```{r warning=FALSE}
-# Plot Bollinger Bands with the closing price
+# Bollinger Bands
 ggplot(df_stock, aes(x = date)) +
   geom_line(aes(y = close), color = "blue") +
   geom_line(aes(y = bb_dn), color = "red", linetype = "dashed") +
@@ -132,16 +141,12 @@ ggplot(df_stock, aes(x = date)) +
   labs(title = "Bollinger Bands", y = "Price") +
   theme_minimal()
 
-```
-
-```{r warning=FALSE}
-# Plot 20-day Rolling Std Dev of Daily Returns
+# 20-day Rolling Std Dev of Daily Returns
 ggplot(df_stock, aes(x = date, y = rolling_sd_20)) +
   geom_line() +
   labs(title = "20-day Rolling Std Dev of Daily Returns",
        x = "Date", y = "Rolling SD (%)") +
   theme_minimal()
-
 ```
 
 ### Other tests and analysis
@@ -168,4 +173,161 @@ print(adf_returns)
 
 ```
 
-#  Model 1: ARIMA with Exogenous Regressors (ARIMAX)
+Findings on Stationarity: 
+- The adjusted price is non-stationary, which is expected because stock prices tend to follow a random walk.
+- The daily returns are stationary, which is typical for financial return series since they fluctuate around a constant mean.
+
+
+# Model 1: ARIMA with Exogenous Regressors (ARIMAX)
+## Preperation for model 1
+### Convert to weekly data
+```{r}
+# Change to weekly data for less computation
+df_weekly <- df_stock %>%
+  mutate(week = floor_date(date, unit = "week", week_start = 1)) %>%
+  group_by(week) %>%
+  summarise(
+    open = first(open),
+    high = max(high, na.rm = TRUE),
+    low = min(low, na.rm = TRUE),
+    close = last(close),
+    volume = sum(volume, na.rm = TRUE),
+    first_adj = first(adjusted),                      
+    adjusted = last(adjusted),                       
+    weekly_return = (last(adjusted) / first_adj - 1) * 100,
+    ma20 = last(ma20),
+    ma50 = last(ma50),
+    rsi14 = last(rsi14),
+    bb_dn = last(bb_dn),
+    bb_mavg = last(bb_mavg),
+    bb_up = last(bb_up),
+    bb_pctB = last(bb_pctB),
+    macd = last(macd),
+    macdSig = last(macdSig),
+    rolling_sd_20 = last(rolling_sd_20),
+    wday = last(wday),
+    sin_wday = last(sin_wday),
+    cos_wday = last(cos_wday)
+  ) %>%
+  ungroup() %>%
+  select(-c(first_adj, wday))
+
+head(df_weekly, 2)
+```
+
+```{r}
+tsdisplay(df_weekly$adjusted)
+tsdisplay(df_weekly$volume)
+tsdisplay(df_weekly$rsi14)
+tsdisplay(df_weekly$ma20)
+tsdisplay(df_weekly$ma50)
+```
+
+
+### Train test split
+```{r}
+cutoff_date <- as.Date("2024-05-31")
+
+train_data <- df_weekly %>%
+  filter(week <= cutoff_date) %>%
+  drop_na(adjusted, volume, rsi14, ma20, ma50)
+
+test_data <- df_weekly %>%
+  filter(week > cutoff_date) %>%
+  drop_na(adjusted, volume, rsi14, ma20, ma50)
+```
+
+### Forecast exogenous variables
+```{r}
+# Define forecast function
+forecast_exog <- function(train_df, test_df, var_name, freq = 52) {
+  
+  train_ts <- ts(train_df[[var_name]], frequency = freq)
+  fit <- auto.arima(train_ts, stepwise = TRUE, approximation = TRUE)
+  h <- nrow(test_df)
+  fc <- forecast(fit, h = h)
+  
+  list(forecast_obj = fc,                     
+       forecast = as.numeric(fc$mean),     
+       AIC = AIC(fit),
+       actual = ts(test_df[[var_name]], frequency = freq, 
+                   start = c(1, length(train_df[[var_name]]) + 1)))
+}
+
+
+# Start forecast
+
+exog_vars <- c("volume", "rsi14", "ma20", "ma50")
+exog_perf <- tibble(variable = character(), 
+                    MAPE = numeric(), 
+                    MSE = numeric(), 
+                    AIC = numeric())
+
+
+exog_forecasts <- list()
+
+for (var in exog_vars) {
+  fc_result <- forecast_exog(train_data, test_data, var)
+  exog_forecasts[[var]] <- fc_result$forecast 
+  
+  # Compute performance metrics
+  actual_ts <- fc_result$actual
+  mape_exog <- mean(abs(fc_result$forecast - actual_ts) / abs(actual_ts)) * 100
+  mse_exog <- mean((fc_result$forecast - actual_ts)^2)
+  
+  exog_perf <- exog_perf %>%
+    add_row(variable = var, MAPE = mape_exog, 
+            MSE = mse_exog, AIC = fc_result$AIC)
+  
+  # Plot 
+  print(
+    autoplot(fc_result$forecast_obj) +
+      autolayer(actual_ts, series = "Actual") +
+      labs(title = paste(symbol, var, "Forecast"),
+           x = "Time", y = var) +
+      theme_minimal()
+  )
+}
+
+exog_perf
+```
+
+## Build model 1
+```{r}
+train_ts <- ts(train_data$adjusted, frequency = 52)
+test_ts <- ts(test_data$adjusted, frequency = 52, 
+              start = c(1, length(train_data$adjusted) + 1))
+
+xreg_train <- as.matrix(train_data %>% select(volume, rsi14, ma20, ma50))
+xreg_test <- cbind(
+  volume = exog_forecasts[["volume"]],
+  rsi14 = exog_forecasts[["rsi14"]],
+  ma20 = exog_forecasts[["ma20"]],
+  ma50 = exog_forecasts[["ma50"]]
+)
+
+# Fit the model / forecast
+model_arima <- auto.arima(train_ts, xreg = xreg_train)
+summary(model_arima)
+
+h <- nrow(test_data)
+final_forecast_1 <- forecast(model_arima, xreg = xreg_test, h = h)
+
+```
+
+## Performance
+```{r}
+autoplot(final_forecast_1) +
+  autolayer(test_ts, series = "Actual") +
+  labs(title = paste(symbol, "ARIMAX Forecast with Forecasted Exogenous Variables"),
+       x = "Time", y = "Adjusted Price") +
+  theme_minimal()
+
+# Calculate error metrics: MAPE and MSE for the final forecast
+mape_final <- mean(abs(final_forecast_1$mean - test_ts) / abs(test_ts)) * 100
+mse_final <- mean((final_forecast_1$mean - test_ts)^2)
+cat("Final ARIMAX Forecast -> MAPE:", mape_final, "\nMSE:", mse_final)
+
+checkresiduals(final_forecast_1)
+```
+
