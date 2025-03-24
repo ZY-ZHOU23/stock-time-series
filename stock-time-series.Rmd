@@ -14,6 +14,16 @@ library(lubridate)
 library(quantmod)
 library(tseries)
 library(forecast)
+
+library(tsibble)
+library(fable)
+library(fabletools)
+library(feasts)
+
+library(xgboost)
+library(caret)
+
+library(rugarch)
 ```
 
 # Data Gathering
@@ -22,7 +32,7 @@ library(forecast)
 
 ```{r}
 symbol <- "AAPL"
-start_date <- as.Date("2022-01-01")
+start_date <- as.Date("2020-01-01")
 end_date <- Sys.Date()
 ```
 
@@ -47,7 +57,7 @@ stock_data <- get(symbol)
 ```{r}
 # Convert time-series data (xts object) to a regular tibble
 df_stock <- tibble(
-  date     = index(stock_data),
+  date     = zoo::index(stock_data),
   open     = as.numeric(stock_data[, paste0(symbol, ".Open")]),
   high     = as.numeric(stock_data[, paste0(symbol, ".High")]),
   low      = as.numeric(stock_data[, paste0(symbol, ".Low")]),
@@ -177,6 +187,25 @@ Findings on Stationarity:
 - The adjusted price is non-stationary, which is expected because stock prices tend to follow a random walk.
 - The daily returns are stationary, which is typical for financial return series since they fluctuate around a constant mean.
 
+```{r}
+# difference
+df_stock <- df_stock %>% 
+  mutate(
+    volume_diff = c(NA, diff(volume)),
+    adjusted_diff = c(NA, diff(adjusted)),    
+    ma20_diff = c(NA, diff(ma20)),
+    ma50_diff = c(NA, diff(ma50)),
+    rsi14_diff = c(NA, diff(rsi14)),
+  )
+
+checkresiduals(df_stock$adjusted_diff)
+checkresiduals(df_stock$volume_diff)
+checkresiduals(df_stock$rsi14_diff)
+checkresiduals(df_stock$ma20_diff)
+checkresiduals(df_stock$ma50_diff)
+```
+
+Based on the Ljung-Box test, `adjusted_diff` and `rsi14_diff` are stationary now. `volume_diff` is still non-stationary, but it is a lot better than the original `volume` variable.
 
 # Model 1: ARIMA with Exogenous Regressors (ARIMAX)
 ## Preperation for model 1
@@ -207,7 +236,12 @@ df_weekly <- df_stock %>%
     rolling_sd_20 = last(rolling_sd_20),
     wday = last(wday),
     sin_wday = last(sin_wday),
-    cos_wday = last(cos_wday)
+    cos_wday = last(cos_wday),
+    volume_diff = mean(volume_diff, na.rm = TRUE),
+    adjusted_diff = mean(adjusted_diff, na.rm = TRUE),    
+    ma20_diff = mean(ma20_diff, na.rm = TRUE),
+    ma50_diff = mean(ma50_diff, na.rm = TRUE),
+    rsi14_diff = mean(rsi14_diff, na.rm = TRUE),
   ) %>%
   ungroup() %>%
   select(-c(first_adj, wday))
@@ -215,75 +249,171 @@ df_weekly <- df_stock %>%
 head(df_weekly, 2)
 ```
 
-```{r}
-tsdisplay(df_weekly$adjusted)
-tsdisplay(df_weekly$volume)
-tsdisplay(df_weekly$rsi14)
-tsdisplay(df_weekly$ma20)
-tsdisplay(df_weekly$ma50)
-```
-
-
 ### Train test split
 ```{r}
-cutoff_date <- as.Date("2024-05-31")
+cutoff_date <- as.Date("2024-12-31")
+begin_date <- as.Date("2023-03-01")
 
 train_data <- df_weekly %>%
-  filter(week <= cutoff_date) %>%
-  drop_na(adjusted, volume, rsi14, ma20, ma50)
+  filter(week >= begin_date & week <= cutoff_date) %>%
+  drop_na(adjusted_diff, volume_diff, rsi14_diff, ma20_diff, ma50_diff)
 
 test_data <- df_weekly %>%
   filter(week > cutoff_date) %>%
-  drop_na(adjusted, volume, rsi14, ma20, ma50)
+  drop_na(adjusted_diff, volume_diff, rsi14_diff, ma20_diff, ma50_diff)
 ```
 
 ### Forecast exogenous variables
 ```{r}
-# Define forecast function
+# Define a forecast function for a given variable (differenced)
 forecast_exog <- function(train_df, test_df, var_name, freq = 52) {
-  
   train_ts <- ts(train_df[[var_name]], frequency = freq)
   fit <- auto.arima(train_ts, stepwise = TRUE, approximation = TRUE)
   h <- nrow(test_df)
   fc <- forecast(fit, h = h)
   
-  list(forecast_obj = fc,                     
-       forecast = as.numeric(fc$mean),     
-       AIC = AIC(fit),
-       actual = ts(test_df[[var_name]], frequency = freq, 
-                   start = c(1, length(train_df[[var_name]]) + 1)))
+  list(
+    model_fit = fit,
+    forecast_obj = fc,                     
+    forecast = as.numeric(fc$mean),     
+    AIC = AIC(fit),
+    actual = ts(test_df[[var_name]], frequency = freq, 
+                start = c(1, length(train_df[[var_name]]) + 1))
+  )
 }
 
-
-# Start forecast
-
-exog_vars <- c("volume", "rsi14", "ma20", "ma50")
+# Define the differenced exogenous variables to forecast
+exog_vars <- c("volume_diff", "rsi14_diff", "ma20_diff", "ma50_diff")
 exog_perf <- tibble(variable = character(), 
                     MAPE = numeric(), 
                     MSE = numeric(), 
                     AIC = numeric())
 
-
 exog_forecasts <- list()
 
 for (var in exog_vars) {
   fc_result <- forecast_exog(train_data, test_data, var)
-  exog_forecasts[[var]] <- fc_result$forecast 
+  exog_forecasts[[var]] <- fc_result$forecast
   
-  # Compute performance metrics
+  # Compute performance metrics for this variable
   actual_ts <- fc_result$actual
   mape_exog <- mean(abs(fc_result$forecast - actual_ts) / abs(actual_ts)) * 100
   mse_exog <- mean((fc_result$forecast - actual_ts)^2)
   
   exog_perf <- exog_perf %>%
-    add_row(variable = var, MAPE = mape_exog, 
-            MSE = mse_exog, AIC = fc_result$AIC)
+    add_row(variable = var, MAPE = mape_exog, MSE = mse_exog, AIC = fc_result$AIC)
   
-  # Plot 
+  # Plot forecast vs. actual for this variable
   print(
     autoplot(fc_result$forecast_obj) +
       autolayer(actual_ts, series = "Actual") +
-      labs(title = paste(symbol, var, "Forecast"),
+      labs(title = paste(symbol, var, "Forecast (Differenced)"),
+           x = "Time", y = var) +
+      theme_minimal()
+  )
+  
+  print(fc_result$model_fit)
+}
+
+exog_perf
+```
+
+## Build model 1
+```{r}
+train_ts_diff <- ts(train_data$adjusted_diff, frequency = 52)
+test_ts_diff  <- ts(test_data$adjusted_diff, frequency = 52, 
+                     start = c(1, length(train_data$adjusted_diff) + 1))
+
+xreg_train_diff <- as.matrix(train_data %>% 
+                               select(volume_diff, rsi14_diff, 
+                                      ma20_diff, ma50_diff))
+xreg_test_diff  <- cbind(
+  volume_diff = exog_forecasts[["volume_diff"]],
+  rsi14_diff  = exog_forecasts[["rsi14_diff"]],
+  ma20_diff   = exog_forecasts[["ma20_diff"]],
+  ma50_diff   = exog_forecasts[["ma50_diff"]]
+)
+
+# Fit the ARIMAX model
+model_arima_diff <- auto.arima(train_ts_diff, xreg = xreg_train_diff)
+summary(model_arima_diff)
+
+# Forecast
+h <- nrow(test_data)
+final_forecast_diff <- forecast(model_arima_diff, 
+                                xreg = xreg_test_diff, h = h)
+```
+
+## Performance
+```{r}
+# convert forecast back to the original scale
+last_train_level <- last(df_weekly %>% filter(week <= cutoff_date) %>% pull(adjusted))
+recovered_forecast <- last_train_level + cumsum(final_forecast_diff$mean)
+test_ts_levels <- ts(test_data$adjusted, frequency = 52, 
+                      start = c(1, length(train_data$adjusted) + 1))
+
+# Plot
+autoplot(ts(recovered_forecast, frequency = 52, 
+            start = c(1, length(train_data$adjusted) + 1))) +
+  autolayer(test_ts_levels, series = "Actual") +
+  labs(title = paste(symbol, "Recovered ARIMAX Forecast vs. Actual (Levels)"),
+       x = "Time", y = "Adjusted Price") +
+  theme_minimal()
+
+# Error metrics
+mape_final <- mean(abs(recovered_forecast - test_ts_levels) / abs(test_ts_levels)) * 100
+mse_final <- mean((recovered_forecast - test_ts_levels)^2)
+cat("Final Recovered ARIMAX Forecast -> MAPE:", mape_final, "\nMSE:", mse_final)
+
+# Check residuals
+checkresiduals(final_forecast_diff)
+```
+
+# Model 2: NNETAR with Exogenous Regressors
+## Preparation for model 2
+### Forecast exogenous variables
+```{r}
+forecast_exog <- function(train_df, test_df, var_name, freq = 52) {
+  train_ts <- ts(train_df[[var_name]], frequency = freq)
+  fit <- nnetar(train_ts)  # Use nnetar for forecasting
+  h <- nrow(test_df)
+  fc <- forecast(fit, h = h)
+  
+  list(
+    forecast_obj = fc,
+    forecast = as.numeric(fc$mean),
+    AIC = NA,  # nnetar() does not provide AIC in the same way
+    actual = ts(test_df[[var_name]], frequency = freq, 
+                start = c(1, length(train_df[[var_name]]) + 1))
+  )
+}
+
+# Define the differenced exogenous variables to forecast
+exog_vars <- c("volume_diff", "rsi14_diff", "ma20_diff", "ma50_diff")
+exog_perf <- tibble(variable = character(), 
+                    MAPE = numeric(), 
+                    MSE = numeric(), 
+                    AIC = numeric())
+exog_forecasts <- list()
+h <- nrow(test_data)
+
+for (var in exog_vars) {
+  fc_result <- forecast_exog(train_data, test_data, var)
+  exog_forecasts[[var]] <- fc_result$forecast
+  
+  # Compute performance metrics for each exogenous variable forecast
+  actual_ts <- fc_result$actual
+  mape_exog <- mean(abs(fc_result$forecast - actual_ts) / abs(actual_ts)) * 100
+  mse_exog <- mean((fc_result$forecast - actual_ts)^2)
+  
+  exog_perf <- exog_perf %>%
+    add_row(variable = var, MAPE = mape_exog, MSE = mse_exog, AIC = fc_result$AIC)
+  
+  # Plot forecast vs. actual for this exogenous variable
+  print(
+    autoplot(fc_result$forecast_obj) +
+      autolayer(actual_ts, series = "Actual") +
+      labs(title = paste(symbol, var, "Forecast (Differenced, NNETAR)"),
            x = "Time", y = var) +
       theme_minimal()
   )
@@ -292,42 +422,354 @@ for (var in exog_vars) {
 exog_perf
 ```
 
-## Build model 1
+## Build model 2
 ```{r}
-train_ts <- ts(train_data$adjusted, frequency = 52)
-test_ts <- ts(test_data$adjusted, frequency = 52, 
-              start = c(1, length(train_data$adjusted) + 1))
+train_tsibble_diff <- train_data %>% as_tsibble(index = week)
 
-xreg_train <- as.matrix(train_data %>% select(volume, rsi14, ma20, ma50))
-xreg_test <- cbind(
-  volume = exog_forecasts[["volume"]],
-  rsi14 = exog_forecasts[["rsi14"]],
-  ma20 = exog_forecasts[["ma20"]],
-  ma50 = exog_forecasts[["ma50"]]
-)
+fit_nnet <- train_tsibble_diff %>%
+  model(
+    nnet = NNETAR(adjusted_diff ~ volume_diff + rsi14_diff + ma20_diff + ma50_diff)
+  )
 
-# Fit the model / forecast
-model_arima <- auto.arima(train_ts, xreg = xreg_train)
-summary(model_arima)
+# forecast
+test_exog_data <- test_data %>% 
+  select(week) %>%
+  mutate(
+    volume_diff = exog_forecasts[["volume_diff"]],
+    rsi14_diff  = exog_forecasts[["rsi14_diff"]],
+    ma20_diff   = exog_forecasts[["ma20_diff"]],
+    ma50_diff   = exog_forecasts[["ma50_diff"]]
+  )
+test_exog_tsibble <- as_tsibble(test_exog_data, index = week)
 
-h <- nrow(test_data)
-final_forecast_1 <- forecast(model_arima, xreg = xreg_test, h = h)
+fc_nnet_diff <- fit_nnet %>% forecast(new_data = test_exog_tsibble)
 
 ```
 
 ## Performance
 ```{r}
-autoplot(final_forecast_1) +
-  autolayer(test_ts, series = "Actual") +
-  labs(title = paste(symbol, "ARIMAX Forecast with Forecasted Exogenous Variables"),
-       x = "Time", y = "Adjusted Price") +
+last_train_level <- last(df_weekly %>% filter(week <= cutoff_date) %>% pull(adjusted))
+
+# Convert the NNETAR differenced forecast to a tibble and order by week
+fc_nnet_diff_df <- fc_nnet_diff %>% as_tibble() %>% arrange(week)
+
+# Recover the level forecasts by cumulatively summing the forecasted differences onto last_train_level
+recovered_forecast_nnet <- last_train_level + cumsum(fc_nnet_diff_df$.mean)
+
+test_levels <- test_data$adjusted
+
+# Build a data frame for plotting and evaluation
+df_plot_nnet <- tibble(
+  week = fc_nnet_diff_df$week,
+  forecast = recovered_forecast_nnet,
+  actual = test_levels
+)
+
+ggplot(df_plot_nnet, aes(x = week)) +
+  geom_line(aes(y = actual), color = "black") +
+  geom_line(aes(y = forecast), color = "blue") +
+  labs(title = paste(symbol, 
+                     "NNETAR Forecast (Recovered Levels) with Forecasted 
+                     Exogenous (Differenced, NNETAR)"),
+       x = "Date", y = "Adjusted Price") +
   theme_minimal()
 
-# Calculate error metrics: MAPE and MSE for the final forecast
-mape_final <- mean(abs(final_forecast_1$mean - test_ts) / abs(test_ts)) * 100
-mse_final <- mean((final_forecast_1$mean - test_ts)^2)
-cat("Final ARIMAX Forecast -> MAPE:", mape_final, "\nMSE:", mse_final)
+# Compute error metrics on the original scale
+mape_nnet <- mean(abs(df_plot_nnet$forecast - df_plot_nnet$actual) / abs(df_plot_nnet$actual)) * 100
+mse_nnet  <- mean((df_plot_nnet$forecast - df_plot_nnet$actual)^2)
+cat("NNETAR Recovered Forecast -> MAPE:", mape_nnet, "\nMSE:", mse_nnet)
 
-checkresiduals(final_forecast_1)
+```
+
+# Model 3: Tree-Based Ensemble
+## Preparation for model 3
+### Helper function
+```{r}
+forecast_exog_xgb <- function(train_df, test_df, var_name, 
+                              lags = 2, freq = 52, nrounds = 50, 
+                              max_depth = 3, eta = 0.1) {
+  require(xgboost)
+  
+  # Note: embed returns rows in reverse order; we reverse it back.
+  x_train <- embed(train_df[[var_name]], lags + 1)
+  x_train <- x_train[nrow(x_train):1, ]
+  y_train <- x_train[, 1]
+  X_train <- x_train[, -1, drop = FALSE]
+  
+  dtrain <- xgb.DMatrix(data = X_train, label = y_train)
+  
+  # Train XGBoost model for one-step forecast
+  params <- list(
+    objective = "reg:squarederror",
+    eta = eta,
+    max_depth = max_depth,
+    subsample = 0.8,
+    colsample_bytree = 0.8
+  )
+  
+  model <- xgb.train(
+    params = params,
+    data = dtrain,
+    nrounds = nrounds,
+    verbose = 0
+  )
+  
+  # Recursive forecast for h steps
+  h_steps <- nrow(test_df)
+  preds <- numeric(h_steps)
+  # Get the last available 'lags' values from the training series (in chronological order)
+  last_values <- tail(train_df[[var_name]], lags)
+  for(i in 1:h_steps) {
+    # For prediction, the features should be: most recent value as lag1, second most recent as lag2, etc.
+    # Our model was trained with features: [lag1, lag2, ..., lag(lags)] where lag1 is the most recent.
+    features <- matrix(rev(last_values), nrow = 1)  # reverse to get most recent first
+    dtest <- xgb.DMatrix(data = features)
+    pred <- predict(model, dtest)
+    preds[i] <- pred
+    # Update last_values: drop the oldest and append the new prediction
+    last_values <- c(last_values[-1], pred)
+  }
+  
+  list(
+    forecast = preds,
+    model_fit = model
+  )
+}
+
+```
+
+### Forecast exogenous variables
+```{r}
+exog_vars <- c("volume_diff", "rsi14_diff", "ma20_diff", "ma50_diff")
+exog_perf <- tibble(variable = character(), MAPE = numeric(), MSE = numeric())
+exog_forecasts <- list()
+
+h <- nrow(test_data)
+
+for (var in exog_vars) {
+  fc_result <- forecast_exog_xgb(train_data, test_data, 
+                                 var, lags = 2, freq = 52, 
+                                 nrounds = 50, max_depth = 3, eta = 0.1)
+  exog_forecasts[[var]] <- fc_result$forecast
+  
+  # Compute performance metrics on test data 
+  actual <- test_data[[var]]
+  mape_exog <- mean(abs(fc_result$forecast - actual) / abs(actual)) * 100
+  mse_exog  <- mean((fc_result$forecast - actual)^2)
+  
+  exog_perf <- exog_perf %>%
+    add_row(variable = var, MAPE = mape_exog, MSE = mse_exog)
+  
+  cat(paste("Exogenous variable:", var, " - MAPE:", round(mape_exog,2), "%, MSE:", round(mse_exog,2), "\n"))
+}
+
+exog_perf
+```
+
+## Build Model 3
+```{r}
+df_tree <- df_weekly %>%
+  arrange(week) %>%
+  mutate(
+    lag1_adjusted = lag(adjusted, 1),
+    lag2_adjusted = lag(adjusted, 2)
+  ) %>%
+  drop_na()
+
+# Split df_tree using the same cutoff
+train_tree <- df_tree %>% filter(week <= cutoff_date)
+test_tree  <- df_tree %>% filter(week > cutoff_date)
+
+# For training, we use observed exogenous values
+X_train <- as.matrix(train_tree %>% select(lag1_adjusted, lag2_adjusted, volume, rsi14, ma20, ma50))
+y_train <- train_tree$adjusted
+
+# For testing, use the observed lag features from test_tree,
+# but replace the current exogenous values with forecasted ones.
+X_test <- as.matrix(test_tree %>% select(lag1_adjusted, lag2_adjusted))
+# Append forecasted exogenous variables (for test period) from our exog_forecasts.
+# Ensure the forecasted vectors have length equal to nrow(test_tree)
+X_test <- cbind(
+  X_test,
+  volume = exog_forecasts[["volume_diff"]],   # Note: if you prefer to use levels, you might forecast the level and not the diff.
+  rsi14  = exog_forecasts[["rsi14_diff"]],
+  ma20   = exog_forecasts[["ma20_diff"]],
+  ma50   = exog_forecasts[["ma50_diff"]]
+)
+
+# Create DMatrix objects for XGBoost
+dtrain <- xgb.DMatrix(data = X_train, label = y_train)
+dtest  <- xgb.DMatrix(data = X_test, label = test_tree$adjusted)
+
+# Set parameters for final XGBoost model
+params <- list(
+  objective = "reg:squarederror",
+  eval_metric = "rmse",
+  eta = 0.1,
+  max_depth = 6,
+  subsample = 0.8,
+  colsample_bytree = 0.8
+)
+
+set.seed(123)
+model_xgb <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 100,
+  watchlist = list(train = dtrain, test = dtest),
+  early_stopping_rounds = 10,
+  verbose = 0
+)
+
+pred_xgb <- predict(model_xgb, dtest)
+
+```
+
+## Performance
+```{r}
+mape_tree <- mean(abs(pred_xgb - test_tree$adjusted) / abs(test_tree$adjusted)) * 100
+mse_tree  <- mean((pred_xgb - test_tree$adjusted)^2)
+cat("Final XGBoost Model -> MAPE:", round(mape_tree,2), "%, MSE:", round(mse_tree,2), "\n")
+
+# Plot actual vs. forecasted adjusted prices
+df_plot_tree <- tibble(
+  week = test_tree$week,
+  actual = test_tree$adjusted,
+  forecast = pred_xgb
+)
+
+ggplot(df_plot_tree, aes(x = week)) +
+  geom_line(aes(y = actual), color = "black") +
+  geom_line(aes(y = forecast), color = "blue") +
+  labs(title = paste(symbol, "XGBoost Forecast vs. Actual (with Forecasted Exogenous)"),
+       x = "Date", y = "Adjusted Price") +
+  theme_minimal()
+```
+
+
+# Model 4: GARCH volatility model 
+## Preparation for model 4
+### Helper function
+```{r}
+# set outliers to quantile boundary (winsorization)
+winsorize <- function(x, lower = 0.02, upper = 0.98) {
+  qs <- quantile(x, probs = c(lower, upper), na.rm = TRUE)
+  x[x < qs[1]] <- qs[1]
+  x[x > qs[2]] <- qs[2]
+  x
+}
+
+forecast_exog_garch <- function(train_df, test_df, var_name, freq = 252) {
+  train_series <- as.numeric(train_df[[var_name]])
+  train_series <- winsorize(train_series, lower = 0.1, upper = 0.9)
+  h <- nrow(test_df)
+  
+  # Specify a simple GARCH(1,1) model with a constant mean
+  spec <- ugarchspec(
+    variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
+    mean.model = list(armaOrder = c(0, 0), include.mean = TRUE),
+    distribution.model = "norm"
+  )
+  
+  fit <- ugarchfit(spec = spec, data = train_series, solver = "hybrid")
+  fc <- ugarchforecast(fit, n.ahead = h)
+  
+  # Extract the one-step-ahead point forecasts from the conditional mean
+  forecast_mean <- fc@forecast$seriesFor
+  list(
+    forecast = as.numeric(forecast_mean)
+  )
+}
+```
+
+Sometimes GARCH fails to converge due to outliers, so we use the helper function `winsorize` to handle outliers.
+
+### Forecast Exogenous Variables
+```{r}
+# GARCH requires more data, use daily data first
+train_data <- df_stock %>%
+  filter(date >= begin_date & date <= cutoff_date) %>%
+  drop_na(adjusted_diff, volume_diff, rsi14_diff, ma20_diff, ma50_diff)
+
+test_data <- df_stock %>%
+  filter(date > cutoff_date) %>%
+  drop_na(adjusted_diff, volume_diff, rsi14_diff, ma20_diff, ma50_diff)
+
+
+exog_vars <- c("volume_diff", "rsi14_diff", "ma20_diff", "ma50_diff")
+exog_forecasts_garch <- list()
+
+for (var in exog_vars) {
+  fc_res <- forecast_exog_garch(train_data, test_data, var, freq = 52)
+  exog_forecasts_garch[[var]] <- fc_res$forecast
+  cat("GARCH forecast for", var, ":", head(fc_res$forecast), "\n")
+}
+
+```
+
+## Build Model 4
+```{r}
+train_ts_diff <- ts(train_data$adjusted_diff, frequency = 252)
+xreg_train_diff <- as.matrix(train_data %>% 
+                               select(volume_diff, rsi14_diff, ma20_diff, ma50_diff))
+
+# For the test set, use the GARCH forecasts for exogenous regressors:
+xreg_test_diff <- cbind(
+  volume_diff = exog_forecasts_garch[["volume_diff"]],
+  rsi14_diff  = exog_forecasts_garch[["rsi14_diff"]],
+  ma20_diff   = exog_forecasts_garch[["ma20_diff"]],
+  ma50_diff   = exog_forecasts_garch[["ma50_diff"]]
+)
+
+# Specify an ARIMAX-GARCH model using rugarch.
+# Here, the mean model is ARIMA(0,0,0) with external regressors (we let the data decide further orders),
+# and the variance is modeled with a GARCH(1,1) process.
+spec_final <- ugarchspec(
+  variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
+  mean.model = list(armaOrder = c(0, 0), external.regressors = xreg_train_diff, include.mean = TRUE),
+  distribution.model = "norm"
+)
+
+fit_final <- ugarchfit(spec = spec_final, data = train_ts_diff, solver = "hybrid")
+summary(fit_final)
+
+# forecast
+h <- nrow(test_data)
+fc_final <- ugarchforecast(fit_final, n.ahead = h, n.roll = 0,
+                           external.forecasts = list(external.regressors = xreg_test_diff))
+# Extract forecasted differences from the conditional mean
+final_forecast_diff <- fc_final@forecast$seriesFor
+```
+
+## Performance
+```{r}
+last_train_level <- last(df_stock %>% filter(date <= cutoff_date) %>% pull(adjusted))
+recovered_forecast <- last_train_level + cumsum(final_forecast_diff)
+
+# Convert actual test levels to a time series (for plotting/evaluation)
+test_ts_levels <- ts(test_data$adjusted, frequency = 252, 
+                      start = c(1, length(train_data$adjusted) + 1))
+
+df_plot <- tibble(
+  date = test_data$date,
+  actual = test_ts_levels,
+  forecast = recovered_forecast
+)
+
+ggplot(df_plot, aes(x = date)) +
+  geom_line(aes(y = actual), color = "black") +
+  geom_line(aes(y = forecast), color = "blue") +
+  labs(title = paste(symbol, "Recovered ARIMAX-GARCH Forecast vs. Actual (Levels)"),
+       x = "Date", y = "Adjusted Price") +
+  theme_minimal()
+
+mape_final <- mean(abs(recovered_forecast - test_ts_levels) / abs(test_ts_levels)) * 100
+mse_final  <- mean((recovered_forecast - test_ts_levels)^2)
+cat("Final ARIMAX-GARCH Forecast -> MAPE:", round(mape_final, 2), "%, MSE:", round(mse_final, 2), "\n")
+
+```
+
+```{r}
+checkresiduals(fit_final)
 ```
 
