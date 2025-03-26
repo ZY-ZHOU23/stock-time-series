@@ -617,7 +617,7 @@ model_xgb <- xgb.train(
   data = dtrain,
   nrounds = 100,
   watchlist = list(train = dtrain, test = dtest),
-  early_stopping_rounds = 10,
+  # early_stopping_rounds = 10, # has precision issue
   verbose = 0
 )
 
@@ -651,7 +651,7 @@ ggplot(df_plot_tree, aes(x = week)) +
 ## Preparation for model 4
 ### Helper function
 ```{r}
-# set outliers to quantile boundary (winsorization)
+# Winsorize: set outliers to quantile boundaries
 winsorize <- function(x, lower = 0.02, upper = 0.98) {
   qs <- quantile(x, probs = c(lower, upper), na.rm = TRUE)
   x[x < qs[1]] <- qs[1]
@@ -659,34 +659,44 @@ winsorize <- function(x, lower = 0.02, upper = 0.98) {
   x
 }
 
-forecast_exog_garch <- function(train_df, test_df, var_name, freq = 252) {
-  train_series <- as.numeric(train_df[[var_name]])
-  train_series <- winsorize(train_series, lower = 0.1, upper = 0.9)
-  h <- nrow(test_df)
-  
-  # Specify a simple GARCH(1,1) model with a constant mean
-  spec <- ugarchspec(
-    variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
-    mean.model = list(armaOrder = c(0, 0), include.mean = TRUE),
-    distribution.model = "norm"
-  )
-  
-  fit <- ugarchfit(spec = spec, data = train_series, solver = "hybrid")
-  fc <- ugarchforecast(fit, n.ahead = h)
-  
-  # Extract the one-step-ahead point forecasts from the conditional mean
-  forecast_mean <- fc@forecast$seriesFor
-  list(
-    forecast = as.numeric(forecast_mean)
-  )
+# Rolling one-step ahead volatility forecast for a series.
+# 'series' is the full (training+test) series.
+# n_train: number of training observations.
+# n_test: number of forecasts (length of test series).
+rolling_vol_forecast <- function(series, n_train, n_test, spec) {
+  vol_forecasts <- numeric(n_test)
+  for(i in 1:n_test) {
+    # Expanding window: use training plus the first (i-1) observations from test.
+    current_train <- series[1:(n_train + i - 1)]
+    fit_i <- ugarchfit(spec = spec, data = current_train, solver = "hybrid", silent = TRUE)
+    fc_i <- ugarchforecast(fit_i, n.ahead = 1)
+    vol_forecasts[i] <- fc_i@forecast$sigmaFor
+  }
+  vol_forecasts
 }
+
+# Rolling forecast for an exogenous variable.
+# Returns a list with one-step ahead forecasted mean and volatility.
+rolling_exog_forecast <- function(series, n_train, n_test, spec) {
+  forecast_means <- numeric(n_test)
+  forecast_vols  <- numeric(n_test)
+  for(i in 1:n_test) {
+    current_train <- series[1:(n_train + i - 1)]
+    fit_i <- ugarchfit(spec = spec, data = current_train, solver = "hybrid", silent = TRUE)
+    fc_i <- ugarchforecast(fit_i, n.ahead = 1)
+    forecast_means[i] <- fc_i@forecast$seriesFor
+    forecast_vols[i]  <- fc_i@forecast$sigmaFor
+  }
+  list(mean = forecast_means, sigma = forecast_vols)
+}
+
 ```
 
 Sometimes GARCH fails to converge due to outliers, so we use the helper function `winsorize` to handle outliers.
 
-### Forecast Exogenous Variables
+### Data Preparation
 ```{r}
-# GARCH requires more data, use daily data first
+# Prepare training and test datasets (drop NAs as before)
 train_data <- df_stock %>%
   filter(date >= begin_date & date <= cutoff_date) %>%
   drop_na(adjusted_diff, volume_diff, rsi14_diff, ma20_diff, ma50_diff)
@@ -695,81 +705,141 @@ test_data <- df_stock %>%
   filter(date > cutoff_date) %>%
   drop_na(adjusted_diff, volume_diff, rsi14_diff, ma20_diff, ma50_diff)
 
+# Create the target series (differenced returns) for training and test.
+train_ts_diff <- ts(train_data$adjusted_diff, frequency = 252)
+test_ts_diff  <- as.numeric(test_data$adjusted_diff)
 
+# Combined series for rolling forecasts:
+combined_ts_diff <- c(as.numeric(train_ts_diff), test_ts_diff)
+n_train <- length(train_ts_diff)
+n_test  <- length(test_ts_diff)
+
+```
+
+
+### Rolling Forecasts for the Main Series and Exogenous Variables
+```{r}
+# Define the main GARCH specification.
+spec_main <- ugarchspec(
+  variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
+  # For returns, use a simple AR(1) mean model.
+  mean.model = list(armaOrder = c(1, 0), include.mean = TRUE),
+  distribution.model = "norm"
+)
+
+# Rolling one-step ahead volatility forecasts for the main series.
+rolling_main_vols <- rolling_vol_forecast(combined_ts_diff, n_train, n_test, spec_main)
+
+# For exogenous variables, we do similar rolling forecasts.
 exog_vars <- c("volume_diff", "rsi14_diff", "ma20_diff", "ma50_diff")
-exog_forecasts_garch <- list()
+spec_exog <- ugarchspec(
+  variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
+  mean.model = list(armaOrder = c(1, 1), include.mean = TRUE),
+  distribution.model = "norm"
+)
 
-for (var in exog_vars) {
-  fc_res <- forecast_exog_garch(train_data, test_data, var, freq = 52)
-  exog_forecasts_garch[[var]] <- fc_res$forecast
-  cat("GARCH forecast for", var, ":", head(fc_res$forecast), "\n")
-}
+# For each exogenous variable, combine training and test series.
+rolling_exog <- lapply(exog_vars, function(var) {
+  series_exog <- winsorize(as.numeric(train_data[[var]]), lower = 0.1, upper = 0.9)
+  combined_exog <- c(series_exog, as.numeric(test_data[[var]]))
+  rolling_exog_forecast(combined_exog, n_train, n_test, spec_exog)
+})
+names(rolling_exog) <- exog_vars
 
 ```
 
 ## Build Model 4
+### Fit the Main ARIMAX-GARCH Model (for Returns)
 ```{r}
-train_ts_diff <- ts(train_data$adjusted_diff, frequency = 252)
-xreg_train_diff <- as.matrix(train_data %>% 
-                               select(volume_diff, rsi14_diff, ma20_diff, ma50_diff))
+# Prepare external regressors for training.
+xreg_train_diff <- as.matrix(train_data %>% select(all_of(exog_vars)))
 
-# For the test set, use the GARCH forecasts for exogenous regressors:
-xreg_test_diff <- cbind(
-  volume_diff = exog_forecasts_garch[["volume_diff"]],
-  rsi14_diff  = exog_forecasts_garch[["rsi14_diff"]],
-  ma20_diff   = exog_forecasts_garch[["ma20_diff"]],
-  ma50_diff   = exog_forecasts_garch[["ma50_diff"]]
-)
-
-# Specify an ARIMAX-GARCH model using rugarch.
-# Here, the mean model is ARIMA(0,0,0) with external regressors (we let the data decide further orders),
-# and the variance is modeled with a GARCH(1,1) process.
 spec_final <- ugarchspec(
   variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
-  mean.model = list(armaOrder = c(0, 0), external.regressors = xreg_train_diff, include.mean = TRUE),
+  # The external regressors affect the mean.
+  mean.model = list(armaOrder = c(1, 0), 
+                    external.regressors = xreg_train_diff, include.mean = TRUE),
   distribution.model = "norm"
 )
 
 fit_final <- ugarchfit(spec = spec_final, data = train_ts_diff, solver = "hybrid")
-summary(fit_final)
+coefs <- coef(fit_final)
+mu    <- coefs["mu"]
+ar1   <- coefs["ar1"]
+mxreg <- coefs[grep("mxreg", names(coefs))]
 
-# forecast
-h <- nrow(test_data)
-fc_final <- ugarchforecast(fit_final, n.ahead = h, n.roll = 0,
-                           external.forecasts = list(external.regressors = xreg_test_diff))
-# Extract forecasted differences from the conditional mean
-final_forecast_diff <- fc_final@forecast$seriesFor
+# Last observed return and price level.
+y_last <- tail(train_data$adjusted_diff, 1)
+last_train_level <- tail(train_data$adjusted, 1)
+
+# For the exogenous effect in the main model, extract rolling forecasted means.
+# Create a matrix (n_test x n_exog) of exogenous forecast means.
+exog_forecast_means <- sapply(rolling_exog, function(fc) fc$mean)
+# Each column corresponds to one exogenous variable.
+
+```
+
+### Nested Monte Carlo Simulation Using Rolling Forecasts
+```{r}
+
+n_sims <- 5000
+
+# Pre-generate shocks for the main model.
+main_shocks <- matrix(rnorm(n_test * n_sims), nrow = n_test, ncol = n_sims)
+
+# Initialize matrix for simulated returns.
+main_returns <- matrix(NA, nrow = n_test, ncol = n_sims)
+
+# Time 1 simulation:
+exog_effect_1 <- apply(matrix(exog_forecast_means[1, ], nrow = 1), 1, function(x) sum(mxreg * x))
+main_returns[1, ] <- mu + ar1 * y_last + exog_effect_1 +
+                     rolling_main_vols[1] * main_shocks[1, ]
+
+# Recursively simulate returns for t = 2,..., n_test.
+for (t in 2:n_test) {
+  exog_effect_t <- apply(matrix(exog_forecast_means[t, ], nrow = 1), 1, function(x) sum(mxreg * x))
+  main_returns[t, ] <- mu + ar1 * main_returns[t - 1, ] +
+                       exog_effect_t +
+                       rolling_main_vols[t] * main_shocks[t, ]
+}
+
+# Recover simulated price paths by cumulatively summing returns and adding last_train_level.
+price_sim_paths <- apply(main_returns, 2, cumsum)
+price_sim_paths <- last_train_level + price_sim_paths
 ```
 
 ## Performance
 ```{r}
-last_train_level <- last(df_stock %>% filter(date <= cutoff_date) %>% pull(adjusted))
-recovered_forecast <- last_train_level + cumsum(final_forecast_diff)
+forecast_price <- rowMeans(price_sim_paths)
+lower_PI <- apply(price_sim_paths, 1, quantile, probs = 0.025)
+upper_PI <- apply(price_sim_paths, 1, quantile, probs = 0.975)
 
-# Convert actual test levels to a time series (for plotting/evaluation)
-test_ts_levels <- ts(test_data$adjusted, frequency = 252, 
-                      start = c(1, length(train_data$adjusted) + 1))
-
+# Prepare plotting data.
+test_ts_levels <- as.numeric(ts(test_data$adjusted, frequency = 252,
+                                 start = c(1, nrow(train_data) + 1)))
 df_plot <- tibble(
   date = test_data$date,
   actual = test_ts_levels,
-  forecast = recovered_forecast
+  forecast = forecast_price,
+  lower_PI = lower_PI,
+  upper_PI = upper_PI
 )
 
 ggplot(df_plot, aes(x = date)) +
   geom_line(aes(y = actual), color = "black") +
   geom_line(aes(y = forecast), color = "blue") +
-  labs(title = paste(symbol, "Recovered ARIMAX-GARCH Forecast vs. Actual (Levels)"),
+  geom_ribbon(aes(ymin = lower_PI, ymax = upper_PI), fill = "blue", alpha = 0.2) +
+  labs(title = paste(symbol, "Rolling ARIMAX-GARCH Forecast via Volatility Simulation"),
        x = "Date", y = "Adjusted Price") +
   theme_minimal()
-
-mape_final <- mean(abs(recovered_forecast - test_ts_levels) / abs(test_ts_levels)) * 100
-mse_final  <- mean((recovered_forecast - test_ts_levels)^2)
-cat("Final ARIMAX-GARCH Forecast -> MAPE:", round(mape_final, 2), "%, MSE:", round(mse_final, 2), "\n")
-
 ```
 
 ```{r}
-checkresiduals(fit_final)
+mape_final <- mean(abs(forecast_price - test_ts_levels) / abs(test_ts_levels)) * 100
+mse_final  <- mean((forecast_price - test_ts_levels)^2)
+cat("Final Rolling Forecast (with exogenous simulation) -> MAPE:", round(mape_final, 2),
+    "%, MSE:", round(mse_final, 2), "\n")
 ```
+
+
 
