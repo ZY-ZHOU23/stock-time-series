@@ -1,0 +1,548 @@
+---
+title: "stock-time-series-tests"
+author: "Zhiyuan Zhou"
+date: "2025-03-26"
+---
+
+# Libraries 
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(lubridate)
+library(quantmod)
+library(tseries)
+library(forecast)
+
+library(tsibble)
+library(fable)
+library(fabletools)
+library(feasts)
+
+library(xgboost)
+library(caret)
+
+library(rugarch)
+```
+
+# Function
+
+This code chunk has been hidden. 
+
+```{r class.source = 'fold-hide', echo=FALSE}
+forecast_stock_models <- function(symbols, 
+                                  start_date = as.Date("2020-01-01"), 
+                                  end_date = Sys.Date(),
+                                  train_start = as.Date("2023-03-01"), 
+                                  cutoff_date = as.Date("2024-12-31")) {
+
+  
+  # Initialize lists to store results per symbol
+  results_list <- list()
+  forecasts_list <- list()
+  
+  for (symbol in symbols) {
+    message("Processing stock: ", symbol)
+    
+    # ------------------- Data Gathering & Preparation ---------------------
+    stock_data <- try(getSymbols(symbol, 
+                                 src = "yahoo", 
+                                 from = start_date, 
+                                 to = end_date,
+                                 auto.assign = FALSE), silent = TRUE)
+    if(inherits(stock_data, "try-error")){
+      message("Data could not be retrieved for ", symbol, "; skipping.")
+      next
+    }
+    
+    df_stock <- tibble(
+      date     = zoo::index(stock_data),
+      open     = as.numeric(stock_data[, paste0(symbol, ".Open")]),
+      high     = as.numeric(stock_data[, paste0(symbol, ".High")]),
+      low      = as.numeric(stock_data[, paste0(symbol, ".Low")]),
+      close    = as.numeric(stock_data[, paste0(symbol, ".Close")]),
+      volume   = as.numeric(stock_data[, paste0(symbol, ".Volume")]),
+      adjusted = as.numeric(stock_data[, paste0(symbol, ".Adjusted")])
+    )
+    
+    # Feature Engineering: Create lag, moving averages, RSI and differences
+    df_stock <- df_stock %>%
+      arrange(date) %>%
+      mutate(
+        daily_return   = (adjusted - lag(adjusted)) / lag(adjusted) * 100,
+        lag1_close     = lag(adjusted, 1),
+        lag2_close     = lag(adjusted, 2),
+        ma20           = zoo::rollmean(adjusted, k = 20, fill = NA, align = "right"),
+        ma50           = zoo::rollmean(adjusted, k = 50, fill = NA, align = "right"),
+        rsi14          = TTR::RSI(adjusted, n = 14),
+        volume_diff    = c(NA, diff(volume)),
+        adjusted_diff  = c(NA, diff(adjusted)),
+        ma20_diff      = c(NA, diff(ma20)),
+        ma50_diff      = c(NA, diff(ma50)),
+        rsi14_diff     = c(NA, diff(rsi14))
+      )
+    
+    # Aggregate to weekly
+    df_weekly <- df_stock %>%
+      mutate(week = floor_date(date, unit = "week", week_start = 1)) %>%
+      group_by(week) %>%
+      summarise(
+        open          = first(open),
+        high          = max(high, na.rm = TRUE),
+        low           = min(low, na.rm = TRUE),
+        close         = last(close),
+        volume        = sum(volume, na.rm = TRUE),
+        adjusted      = last(adjusted),
+        adjusted_diff = mean(adjusted_diff, na.rm = TRUE),
+        volume_diff   = mean(volume_diff, na.rm = TRUE),
+        rsi14_diff    = mean(rsi14_diff, na.rm = TRUE),
+        ma20_diff     = mean(ma20_diff, na.rm = TRUE),
+        ma50_diff     = mean(ma50_diff, na.rm = TRUE)
+      ) %>%
+      ungroup()
+    
+    # Train-test split for weekly models
+    train_data_week <- df_weekly %>%
+      filter(week >= train_start & week <= cutoff_date) %>%
+      drop_na()
+    
+    test_data_week <- df_weekly %>%
+      filter(week > cutoff_date) %>%
+      drop_na()
+    
+    if(nrow(train_data_week) == 0 || nrow(test_data_week) == 0) {
+      message("Insufficient training/test weekly data for ", symbol, "; skipping.")
+      next
+    }
+    
+    # Train-test split for daily models
+    train_data_day <- df_stock %>%
+      filter(date >= train_start & date <= cutoff_date) %>%
+      drop_na()
+    
+    test_data_day <- df_stock %>%
+      filter(date > cutoff_date) %>%
+      drop_na()
+    
+    if(nrow(train_data_day) == 0 || nrow(test_data_day) == 0) {
+      message("Insufficient daily data for ", symbol, "; skipping.")
+      next
+    }
+    
+    message("Data Gathering for stock `", symbol, "` Done")
+    
+    # ------------------- Model 1: ARIMAX ------------------------------------
+    # Function to forecast exogenous regressors using auto.arima
+    forecast_exog <- function(train_df, test_df, var_name, freq = 52) {
+      train_ts <- ts(train_df[[var_name]], frequency = freq)
+      fit <- auto.arima(train_ts, stepwise = TRUE, approximation = TRUE)
+      h <- nrow(test_df)
+      fc <- forecast(fit, h = h)
+      list(forecast = as.numeric(fc$mean))
+    }
+    exog_vars <- c("volume_diff", "rsi14_diff", "ma20_diff", "ma50_diff")
+    exog_forecasts <- list()
+    for (var in exog_vars) {
+      fc_result <- forecast_exog(train_data_week, test_data_week, var)
+      exog_forecasts[[var]] <- fc_result$forecast
+    }
+    
+    # Fit ARIMAX model on differenced adjusted price
+    train_ts_diff <- ts(train_data_week$adjusted_diff, frequency = 52)
+    test_ts_diff  <- ts(test_data_week$adjusted_diff, frequency = 52, 
+                        start = c(1, length(train_data_week$adjusted_diff) + 1))
+    xreg_train_diff <- as.matrix(train_data_week %>% select(all_of(exog_vars)))
+    xreg_test_diff  <- as.matrix(data.frame(
+      volume_diff = exog_forecasts[["volume_diff"]],
+      rsi14_diff  = exog_forecasts[["rsi14_diff"]],
+      ma20_diff   = exog_forecasts[["ma20_diff"]],
+      ma50_diff   = exog_forecasts[["ma50_diff"]]
+    ))
+    
+    model_arima <- auto.arima(train_ts_diff, xreg = xreg_train_diff)
+    fc_arima_diff <- forecast(model_arima, xreg = xreg_test_diff, h = nrow(test_data_week))
+    
+    # Recover forecasted levels and compute performance metrics
+    last_train_level <- last(train_data_week$adjusted)
+    recovered_forecast_arima <- last_train_level + cumsum(fc_arima_diff$mean)
+    test_ts_levels <- ts(test_data_week$adjusted, frequency = 52, 
+                         start = c(1, length(train_data_week$adjusted) + 1))
+    
+    mape_arima <- mean(abs(recovered_forecast_arima - test_ts_levels) / abs(test_ts_levels)) * 100
+    mse_arima  <- mean((recovered_forecast_arima - test_ts_levels)^2)
+    
+    # Create forecast tibble for ARIMAX
+    fc_ARIMAX <- tibble(
+      week = test_data_week$week,
+      forecast = recovered_forecast_arima
+    )
+    
+    message(" - ARIMAX for stock `", symbol, "` Done")
+    # print(test_data_week$week)
+    # print(recovered_forecast_arima)
+    
+    # ------------------- Model 2: NNETAR ------------------------------------
+    # Forecast exogenous variables using nnetar
+    forecast_exog_nnet <- function(train_df, test_df, var_name, freq = 52) {
+      train_ts <- ts(train_df[[var_name]], frequency = freq)
+      fit <- nnetar(train_ts)
+      h <- nrow(test_df)
+      fc <- forecast(fit, h = h)
+      list(forecast = as.numeric(fc$mean))
+    }
+    exog_forecasts_nnet <- list()
+    for (var in exog_vars) {
+      fc_result <- forecast_exog_nnet(train_data_week, test_data_week, var)
+      exog_forecasts_nnet[[var]] <- fc_result$forecast
+    }
+    
+    # Fit NNETAR model using fable on the differenced series
+    train_tsibble_diff <- as_tsibble(train_data_week, index = week)
+    fit_nnet <- train_tsibble_diff %>%
+      model(nnet = NNETAR(adjusted_diff ~ volume_diff + rsi14_diff + ma20_diff + ma50_diff))
+    
+    test_exog_data <- test_data_week %>% mutate(
+      volume_diff = exog_forecasts_nnet[["volume_diff"]],
+      rsi14_diff  = exog_forecasts_nnet[["rsi14_diff"]],
+      ma20_diff   = exog_forecasts_nnet[["ma20_diff"]],
+      ma50_diff   = exog_forecasts_nnet[["ma50_diff"]]
+    )
+    test_tsibble <- as_tsibble(test_exog_data, index = week)
+    fc_nnet_diff <- fit_nnet %>% forecast(new_data = test_tsibble)
+    fc_nnet_diff_df <- fc_nnet_diff %>% as_tibble() %>% arrange(week)
+    
+    recovered_forecast_nnet <- last(train_data_week$adjusted) + cumsum(fc_nnet_diff_df$.mean)
+    mape_nnet <- mean(abs(recovered_forecast_nnet - test_data_week$adjusted) / abs(test_data_week$adjusted)) * 100
+    mse_nnet  <- mean((recovered_forecast_nnet - test_data_week$adjusted)^2)
+    
+    fc_NNETAR <- tibble(
+      week = test_data_week$week,
+      forecast = recovered_forecast_nnet
+    )
+    
+    message(" - NNETAR for stock `", symbol, "` Done")
+    # print(recovered_forecast_nnet)
+    
+    # ------------------- Model 3: XGBoost (Tree-Based Ensemble) -------------
+    # Forecast exogenous variables using a simple XGBoost regressor
+    forecast_exog_xgb <- function(train_df, test_df, var_name, lags = 2) {
+      x_train <- embed(train_df[[var_name]], lags + 1)
+      x_train <- x_train[nrow(x_train):1, ]
+      y_train <- x_train[, 1]
+      X_train <- x_train[, -1, drop = FALSE]
+      dtrain <- xgb.DMatrix(data = X_train, label = y_train)
+      params <- list(objective = "reg:squarederror", eta = 0.1, max_depth = 3, 
+                     subsample = 0.8, colsample_bytree = 0.8)
+      model <- xgb.train(params = params, data = dtrain, nrounds = 50, verbose = 0)
+      h_steps <- nrow(test_df)
+      preds <- numeric(h_steps)
+      last_values <- tail(train_df[[var_name]], lags)
+      for(i in 1:h_steps) {
+        features <- matrix(rev(last_values), nrow = 1)
+        dtest <- xgb.DMatrix(data = features)
+        pred <- predict(model, dtest)
+        preds[i] <- pred
+        last_values <- c(last_values[-1], pred)
+      }
+      preds
+    }
+    exog_forecasts_xgb <- list()
+    for (var in exog_vars) {
+      fc <- forecast_exog_xgb(train_data_week, test_data_week, var, lags = 2)
+      exog_forecasts_xgb[[var]] <- fc
+    }
+    
+    # Prepare data for the XGBoost ensemble model (using lagged adjusted levels)
+    df_tree <- df_weekly %>%
+      arrange(week) %>%
+      mutate(
+        lag1_adjusted = lag(adjusted, 1),
+        lag2_adjusted = lag(adjusted, 2)
+      ) %>%
+      drop_na()
+    train_tree <- df_tree %>% filter(week <= cutoff_date)
+    test_tree  <- df_tree %>% filter(week > cutoff_date)
+    if(nrow(train_tree) == 0 || nrow(test_tree) == 0) {
+      message("Insufficient tree-model data for ", symbol, "; skipping XGBoost.")
+      next
+    }
+    
+    X_train <- as.matrix(train_tree %>% 
+                           select(lag1_adjusted, lag2_adjusted, volume, 
+                                  rsi14_diff, ma20_diff, ma50_diff))
+    y_train <- train_tree$adjusted
+    X_test <- as.matrix(test_tree %>% select(lag1_adjusted, lag2_adjusted))
+    X_test <- cbind(
+      X_test,
+      volume     = exog_forecasts_xgb[["volume_diff"]],
+      rsi14_diff = exog_forecasts_xgb[["rsi14_diff"]],
+      ma20_diff  = exog_forecasts_xgb[["ma20_diff"]],
+      ma50_diff  = exog_forecasts_xgb[["ma50_diff"]]
+    )
+    
+    dtrain <- xgb.DMatrix(data = X_train, label = y_train)
+    dtest  <- xgb.DMatrix(data = X_test, label = test_tree$adjusted)
+    params <- list(objective = "reg:squarederror", eta = 0.1, max_depth = 6, 
+                   subsample = 0.8, colsample_bytree = 0.8)
+    set.seed(123)
+    model_xgb <- xgb.train(params = params, data = dtrain, nrounds = 100, verbose = 0)
+    pred_xgb <- predict(model_xgb, dtest)
+    
+    mape_xgb <- mean(abs(pred_xgb - test_tree$adjusted) / abs(test_tree$adjusted)) * 100
+    mse_xgb  <- mean((pred_xgb - test_tree$adjusted)^2)
+    
+    fc_XGBoost <- tibble(
+      week = test_tree$week,
+      forecast = pred_xgb
+    )
+    
+    message(" - XGBoost for stock `", symbol, "` Done")
+    # print(pred_xgb)
+    
+    # ------------------- Model 4: GARCH -------------------------------------
+    # For GARCH we use daily data. Prepare training and test datasets (daily)
+    train_ts_diff_day <- ts(train_data_day$adjusted_diff, frequency = 252)
+    test_ts_diff_day  <- as.numeric(test_data_day$adjusted_diff)
+    combined_ts_diff  <- c(as.numeric(train_ts_diff_day), test_ts_diff_day)
+    n_train <- length(train_ts_diff_day)
+    n_test  <- length(test_ts_diff_day)
+    
+    # Main GARCH spec for returns
+    spec_main <- ugarchspec(
+      variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
+      mean.model = list(armaOrder = c(1, 0), include.mean = TRUE),
+      distribution.model = "norm"
+    )
+    
+    # Rolling one-step ahead volatility forecast
+    rolling_main_vols <- numeric(n_test)
+    for(i in 1:n_test) {
+      current_train <- combined_ts_diff[1:(n_train + i - 1)]
+      fit_i <- tryCatch(suppressWarnings(ugarchfit(spec = spec_main, 
+                               data = current_train, 
+                               solver = "hybrid", silent = TRUE)),
+                        error = function(e) NULL)
+      if(is.null(fit_i)){
+        rolling_main_vols[i] <- NA
+      } else {
+        fc_i <- ugarchforecast(fit_i, n.ahead = 1)
+        rolling_main_vols[i] <- fc_i@forecast$sigmaFor
+      }
+    }
+    
+    # Forecast exogenous variables for GARCH via rolling forecasts
+    spec_exog <- ugarchspec(
+      variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
+      mean.model = list(armaOrder = c(1, 1), include.mean = TRUE),
+      distribution.model = "norm"
+    )
+    rolling_exog_list <- list()
+    for(var in exog_vars) {
+      series_exog <- train_data_day[[var]]
+      combined_exog <- c(series_exog, test_data_day[[var]])
+      fc_means <- numeric(n_test)
+      for(i in 1:n_test) {
+        current_train <- combined_exog[1:(n_train + i - 1)]
+        fit_i <- tryCatch(suppressWarnings(ugarchfit(spec = spec_main, 
+                               data = current_train, 
+                               solver = "hybrid", silent = TRUE)),
+                          error = function(e) NULL)
+        if(is.null(fit_i)){
+          fc_means[i] <- NA
+        } else {
+          fc_i <- suppressWarnings(ugarchforecast(fit_i, n.ahead = 1))
+          fc_means[i] <- fc_i@forecast$seriesFor
+        }
+      }
+      rolling_exog_list[[var]] <- fc_means
+    }
+    
+    # Fit final ARIMAX-GARCH model on the daily training series
+    xreg_train_diff_day <- as.matrix(train_data_day %>% select(all_of(exog_vars)))
+    spec_final <- ugarchspec(
+      variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
+      mean.model = list(armaOrder = c(1, 0), 
+                        external.regressors = xreg_train_diff_day, 
+                        include.mean = TRUE),
+      distribution.model = "norm"
+    )
+    fit_final <- ugarchfit(spec = spec_final, data = train_ts_diff_day, solver = "hybrid")
+    coefs <- coef(fit_final)
+    mu  <- coefs["mu"]
+    ar1 <- coefs["ar1"]
+    mxreg <- coefs[grep("mxreg", names(coefs))]
+    y_last <- tail(train_data_day$adjusted_diff, 1)
+    last_train_level_day <- tail(train_data_day$adjusted, 1)
+    
+    # Nested Monte Carlo simulation using rolling volatility and exogenous forecasts
+    n_sims <- 5000
+    main_shocks <- matrix(rnorm(n_test * n_sims), nrow = n_test, ncol = n_sims)
+    main_returns <- matrix(NA, nrow = n_test, ncol = n_sims)
+    for(sim in 1:n_sims){
+      exog_effect <- sum(mxreg * sapply(rolling_exog_list, function(x) x[1]))
+      main_returns[1, sim] <- mu + ar1 * y_last + exog_effect +
+                              rolling_main_vols[1] * main_shocks[1, sim]
+      for(t in 2:n_test){
+        exog_effect <- sum(mxreg * sapply(rolling_exog_list, function(x) x[t]))
+        main_returns[t, sim] <- mu + ar1 * main_returns[t - 1, sim] +
+                                exog_effect + rolling_main_vols[t] * main_shocks[t, sim]
+      }
+    }
+    price_sim_paths <- apply(main_returns, 2, cumsum)
+    price_sim_paths <- last_train_level_day + price_sim_paths
+    forecast_price_daily <- rowMeans(price_sim_paths, na.rm = TRUE)
+    
+    # Aggregate daily GARCH forecasts to weekly by grouping on date
+    df_plot <- tibble(
+      date = test_data_day$date,
+      forecast = forecast_price_daily
+    )
+    df_weekly_garch <- df_plot %>%
+      mutate(week = floor_date(date, unit = "week", week_start = 1)) %>%
+      group_by(week) %>%
+      summarise(forecast = last(forecast)) %>%
+      ungroup()
+    
+    mape_garch <- mean(abs(forecast_price_daily - test_data_day$adjusted) / abs(test_data_day$adjusted)) * 100
+    mse_garch  <- mean((forecast_price_daily - test_data_day$adjusted)^2, na.rm = TRUE)
+    
+    fc_GARCH <- df_weekly_garch
+    
+    message(" - GARCH for stock `", symbol, "` Done")
+    # print(fc_GARCH)
+    
+      # ------------------- Combined Forecast -------------------------------------
+    combined_forecasts <- tibble(
+      week = test_data_week$week,
+      ARIMAX   = recovered_forecast_arima,
+      NNETAR   = recovered_forecast_nnet,
+      XGBoost  = pred_xgb,
+      GARCH    = fc_GARCH$forecast[-1]
+    )
+
+    combined_forecasts <- combined_forecasts %>%
+      mutate(Mean_Forecast = (ARIMAX + NNETAR + XGBoost + GARCH) / 4)
+
+    mape_comb <- mean(abs(combined_forecasts$Mean_Forecast -
+                             test_data_week$adjusted) / abs(test_data_week$adjusted)) * 100
+    mse_comb  <- mean((combined_forecasts$Mean_Forecast -
+                          test_data_week$adjusted)^2)
+    
+    
+    # ------------------- Save Results for This Symbol -----------------------
+    perf <- tibble(
+      Symbol       = symbol,
+      ARIMAX_MAPE  = mape_arima,
+      ARIMAX_MSE   = mse_arima,
+      NNETAR_MAPE  = mape_nnet,
+      NNETAR_MSE   = mse_nnet,
+      XGBoost_MAPE = mape_xgb,
+      XGBoost_MSE  = mse_xgb,
+      GARCH_MAPE   = mape_garch,
+      GARCH_MSE    = mse_garch,
+      COMB_MAPE    = mape_comb,
+      COMB_MSE     = mse_comb
+    )
+    
+    results_list[[symbol]] <- perf
+    forecasts_list[[symbol]] <- list(
+      ARIMAX  = fc_ARIMAX,
+      NNETAR  = fc_NNETAR,
+      XGBoost = fc_XGBoost,
+      GARCH   = fc_GARCH[-1, ], 
+      COMB    = combined_forecasts$Mean_Forecast,
+      Actual  = test_data_week$adjusted
+    )
+  }
+  
+  # Combine performance results across symbols
+  performance_df <- bind_rows(results_list)
+  
+  list(
+    performance = performance_df,
+    forecasts   = forecasts_list
+  )
+}
+
+```
+
+# Test
+```{r cache=TRUE, message=FALSE}
+symbols <- c("AAPL", "TSLA", "PLTR", "GME", "EDU", "JPM", "BABA", "TCOM", "NVDA", "NCLH")
+
+stocks <- forecast_stock_models(
+  symbols = symbols,
+  start_date = as.Date("2020-01-01"),
+  end_date = Sys.Date(),
+  train_start = as.Date("2023-03-01"),
+  cutoff_date = as.Date("2024-12-31")
+)
+```
+
+```{r}
+stocks$performance
+```
+
+```{r}
+for (symbol in symbols) {
+
+  df_plot <- tibble(
+    week    = stocks$forecasts[[symbol]]$ARIMAX$week,     
+    ARIMAX  = stocks$forecasts[[symbol]]$ARIMAX$forecast,
+    NNETAR  = stocks$forecasts[[symbol]]$NNETAR$forecast,
+    XGBoost = stocks$forecasts[[symbol]]$XGBoost$forecast,
+    GARCH   = stocks$forecasts[[symbol]]$GARCH$forecast,
+    COMB    = stocks$forecasts[[symbol]]$COMB,
+    Actual  = stocks$forecasts[[symbol]]$Actual
+  )
+  
+  df_plot_long <- df_plot %>%
+    pivot_longer(
+      cols = c("ARIMAX", "NNETAR", "XGBoost", "GARCH", "COMB", "Actual"),
+      names_to = "Model",
+      values_to = "Forecast"
+    )
+  
+  p <- ggplot(df_plot_long, aes(x = week, y = Forecast, color = Model)) +
+    geom_line(linewidth = 1) +
+    scale_color_manual(values = c("ARIMAX"  = "aquamarine",
+                                  "NNETAR"  = "beige",
+                                  "XGBoost" = "darkseagreen",
+                                  "GARCH"   = "cadetblue1",
+                                  "COMB"    = "red",
+                                  "Actual"  = "black")) +
+    labs(title = paste(symbol, "Forecast vs. Actual"), 
+         x = "Week", 
+         y = "Adjusted Price") +
+    theme_minimal()
+  
+  print(p)
+}
+
+```
+
+
+```{r warning=FALSE}
+# Pivot the performance data to long format
+perf_long <- stocks$performance %>%
+  pivot_longer(
+    cols = -Symbol,
+    names_to = c("Model", "Metric"),
+    names_sep = "_",
+    values_to = "Value"
+  )
+
+# Separate plots for MAPE and MSE
+perf_long %>% 
+  filter(Metric == "MAPE") %>%
+  ggplot(aes(x = Symbol, y = Value, fill = Model)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "MAPE by Model and Stock", y = "MAPE (%)", x = "Stock") +
+  theme_minimal()
+
+perf_long %>% 
+  filter(Metric == "MSE") %>%
+  ggplot(aes(x = Symbol, y = Value, fill = Model)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "MSE by Model and Stock", y = "MSE", x = "Stock") +
+  theme_minimal()
+```
+

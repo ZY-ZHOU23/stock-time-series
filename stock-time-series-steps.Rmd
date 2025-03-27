@@ -8,7 +8,7 @@ output:
 \newpage
 # Libraries
 
-```{r message=FALSE}
+```{r message=FALSE, warning=FALSE}
 library(tidyverse)
 library(lubridate)
 library(quantmod)
@@ -69,7 +69,7 @@ df_stock <- tibble(
 glimpse(df_stock)
 summary(df_stock)
 
-# Plot Adjusted Closing Price over time with a dynamic title
+# Plot Adjusted Closing Price
 ggplot(df_stock, aes(x = date, y = adjusted)) +
   geom_line() +
   labs(title = paste(symbol, "Adjusted Closing Price"),
@@ -90,11 +90,9 @@ df_stock %>%
 ### Add new variables
 
 ```{r}
-# Calculate Bollinger Bands using high, low, and close
+# Bollinger Bands and MACD
 bb <- BBands(HLC = df_stock %>% select(high, low, close),
              n = 20, maType = "SMA", sd = 2)
-
-# Calculate MACD based on the adjusted closing price
 macd_values <- MACD(df_stock$adjusted, nFast = 12, nSlow = 26, nSig = 9)
 
 # Add all new variables
@@ -107,11 +105,11 @@ df_stock <- df_stock %>%
     ma20 = rollmean(adjusted, k = 20, fill = NA, align = "right"),
     ma50 = rollmean(adjusted, k = 50, fill = NA, align = "right"),
     rsi14 = RSI(adjusted, n = 14),
-    bb_dn   = bb[, "dn"],
+    bb_dn = bb[, "dn"], # lower band
     bb_mavg = bb[, "mavg"],
-    bb_up   = bb[, "up"],
-    bb_pctB = bb[, "pctB"],
-    macd    = macd_values[, "macd"],
+    bb_up = bb[, "up"],
+    bb_pctB = bb[, "pctB"], # 0-1: 0 lower band, 1 upper band
+    macd = macd_values[, "macd"],
     macdSig = macd_values[, "signal"],
     rolling_sd_20 = rollapply(daily_return, width = 20, 
                               FUN = sd, fill = NA, align = "right"),
@@ -145,9 +143,9 @@ ggplot(df_stock_long, aes(x = date, y = value, color = variable)) +
 
 # Bollinger Bands
 ggplot(df_stock, aes(x = date)) +
-  geom_line(aes(y = close), color = "blue") +
-  geom_line(aes(y = bb_dn), color = "red", linetype = "dashed") +
-  geom_line(aes(y = bb_up), color = "red", linetype = "dashed") +
+  geom_line(aes(y = close), color = "skyblue") +
+  geom_line(aes(y = bb_dn), color = "brown", linetype = "dashed") +
+  geom_line(aes(y = bb_up), color = "brown", linetype = "dashed") +
   labs(title = "Bollinger Bands", y = "Price") +
   theme_minimal()
 
@@ -161,7 +159,7 @@ ggplot(df_stock, aes(x = date, y = rolling_sd_20)) +
 
 ### Other tests and analysis
 ```{r}
-# Correlation Matrix of Numeric Features
+# Correlation Matrix
 df_numerics <- df_stock %>%
   select(where(is.numeric)) %>%
   drop_na()  # Remove rows with NA for accurate correlation
@@ -254,11 +252,11 @@ head(df_weekly, 2)
 cutoff_date <- as.Date("2024-12-31")
 begin_date <- as.Date("2023-03-01")
 
-train_data <- df_weekly %>%
+train_data_week <- df_weekly %>%
   filter(week >= begin_date & week <= cutoff_date) %>%
   drop_na(adjusted_diff, volume_diff, rsi14_diff, ma20_diff, ma50_diff)
 
-test_data <- df_weekly %>%
+test_data_week <- df_weekly %>%
   filter(week > cutoff_date) %>%
   drop_na(adjusted_diff, volume_diff, rsi14_diff, ma20_diff, ma50_diff)
 ```
@@ -292,7 +290,7 @@ exog_perf <- tibble(variable = character(),
 exog_forecasts <- list()
 
 for (var in exog_vars) {
-  fc_result <- forecast_exog(train_data, test_data, var)
+  fc_result <- forecast_exog(train_data_week, test_data_week, var)
   exog_forecasts[[var]] <- fc_result$forecast
   
   # Compute performance metrics for this variable
@@ -320,11 +318,11 @@ exog_perf
 
 ## Build model 1
 ```{r}
-train_ts_diff <- ts(train_data$adjusted_diff, frequency = 52)
-test_ts_diff  <- ts(test_data$adjusted_diff, frequency = 52, 
-                     start = c(1, length(train_data$adjusted_diff) + 1))
+train_ts_diff <- ts(train_data_week$adjusted_diff, frequency = 52)
+test_ts_diff  <- ts(test_data_week$adjusted_diff, frequency = 52, 
+                     start = c(1, length(train_data_week$adjusted_diff) + 1))
 
-xreg_train_diff <- as.matrix(train_data %>% 
+xreg_train_diff <- as.matrix(train_data_week %>% 
                                select(volume_diff, rsi14_diff, 
                                       ma20_diff, ma50_diff))
 xreg_test_diff  <- cbind(
@@ -339,7 +337,7 @@ model_arima_diff <- auto.arima(train_ts_diff, xreg = xreg_train_diff)
 summary(model_arima_diff)
 
 # Forecast
-h <- nrow(test_data)
+h <- nrow(test_data_week)
 final_forecast_diff <- forecast(model_arima_diff, 
                                 xreg = xreg_test_diff, h = h)
 ```
@@ -347,22 +345,24 @@ final_forecast_diff <- forecast(model_arima_diff,
 ## Performance
 ```{r}
 # convert forecast back to the original scale
-last_train_level <- last(df_weekly %>% filter(week <= cutoff_date) %>% pull(adjusted))
-recovered_forecast <- last_train_level + cumsum(final_forecast_diff$mean)
-test_ts_levels <- ts(test_data$adjusted, frequency = 52, 
-                      start = c(1, length(train_data$adjusted) + 1))
+last_train_level <- last(df_weekly %>% 
+                           filter(week <= cutoff_date) %>% 
+                           pull(adjusted))
+recovered_forecast_arima <- last_train_level + cumsum(final_forecast_diff$mean)
+test_ts_levels <- ts(test_data_week$adjusted, frequency = 52, 
+                      start = c(1, length(train_data_week$adjusted) + 1))
 
 # Plot
-autoplot(ts(recovered_forecast, frequency = 52, 
-            start = c(1, length(train_data$adjusted) + 1))) +
+autoplot(ts(recovered_forecast_arima, frequency = 52, 
+            start = c(1, length(train_data_week$adjusted) + 1))) +
   autolayer(test_ts_levels, series = "Actual") +
   labs(title = paste(symbol, "Recovered ARIMAX Forecast vs. Actual (Levels)"),
        x = "Time", y = "Adjusted Price") +
   theme_minimal()
 
 # Error metrics
-mape_final <- mean(abs(recovered_forecast - test_ts_levels) / abs(test_ts_levels)) * 100
-mse_final <- mean((recovered_forecast - test_ts_levels)^2)
+mape_final <- mean(abs(recovered_forecast_arima - test_ts_levels) / abs(test_ts_levels)) * 100
+mse_final <- mean((recovered_forecast_arima - test_ts_levels)^2)
 cat("Final Recovered ARIMAX Forecast -> MAPE:", mape_final, "\nMSE:", mse_final)
 
 # Check residuals
@@ -395,10 +395,10 @@ exog_perf <- tibble(variable = character(),
                     MSE = numeric(), 
                     AIC = numeric())
 exog_forecasts <- list()
-h <- nrow(test_data)
+h <- nrow(train_data_week)
 
 for (var in exog_vars) {
-  fc_result <- forecast_exog(train_data, test_data, var)
+  fc_result <- forecast_exog(train_data_week, test_data_week, var)
   exog_forecasts[[var]] <- fc_result$forecast
   
   # Compute performance metrics for each exogenous variable forecast
@@ -424,7 +424,7 @@ exog_perf
 
 ## Build model 2
 ```{r}
-train_tsibble_diff <- train_data %>% as_tsibble(index = week)
+train_tsibble_diff <- train_data_week %>% as_tsibble(index = week)
 
 fit_nnet <- train_tsibble_diff %>%
   model(
@@ -432,7 +432,7 @@ fit_nnet <- train_tsibble_diff %>%
   )
 
 # forecast
-test_exog_data <- test_data %>% 
+test_exog_data <- test_data_week %>% 
   select(week) %>%
   mutate(
     volume_diff = exog_forecasts[["volume_diff"]],
@@ -456,7 +456,7 @@ fc_nnet_diff_df <- fc_nnet_diff %>% as_tibble() %>% arrange(week)
 # Recover the level forecasts by cumulatively summing the forecasted differences onto last_train_level
 recovered_forecast_nnet <- last_train_level + cumsum(fc_nnet_diff_df$.mean)
 
-test_levels <- test_data$adjusted
+test_levels <- test_data_week$adjusted
 
 # Build a data frame for plotting and evaluation
 df_plot_nnet <- tibble(
@@ -544,16 +544,16 @@ exog_vars <- c("volume_diff", "rsi14_diff", "ma20_diff", "ma50_diff")
 exog_perf <- tibble(variable = character(), MAPE = numeric(), MSE = numeric())
 exog_forecasts <- list()
 
-h <- nrow(test_data)
+h <- nrow(test_data_week)
 
 for (var in exog_vars) {
-  fc_result <- forecast_exog_xgb(train_data, test_data, 
+  fc_result <- forecast_exog_xgb(train_data_week, test_data_week, 
                                  var, lags = 2, freq = 52, 
                                  nrounds = 50, max_depth = 3, eta = 0.1)
   exog_forecasts[[var]] <- fc_result$forecast
   
   # Compute performance metrics on test data 
-  actual <- test_data[[var]]
+  actual <- test_data_week[[var]]
   mape_exog <- mean(abs(fc_result$forecast - actual) / abs(actual)) * 100
   mse_exog  <- mean((fc_result$forecast - actual)^2)
   
@@ -697,17 +697,17 @@ Sometimes GARCH fails to converge due to outliers, so we use the helper function
 ### Data Preparation
 ```{r}
 # Prepare training and test datasets (drop NAs as before)
-train_data <- df_stock %>%
+train_data_day <- df_stock %>%
   filter(date >= begin_date & date <= cutoff_date) %>%
   drop_na(adjusted_diff, volume_diff, rsi14_diff, ma20_diff, ma50_diff)
 
-test_data <- df_stock %>%
+test_data_day <- df_stock %>%
   filter(date > cutoff_date) %>%
   drop_na(adjusted_diff, volume_diff, rsi14_diff, ma20_diff, ma50_diff)
 
 # Create the target series (differenced returns) for training and test.
-train_ts_diff <- ts(train_data$adjusted_diff, frequency = 252)
-test_ts_diff  <- as.numeric(test_data$adjusted_diff)
+train_ts_diff <- ts(train_data_day$adjusted_diff, frequency = 252)
+test_ts_diff  <- as.numeric(test_data_day$adjusted_diff)
 
 # Combined series for rolling forecasts:
 combined_ts_diff <- c(as.numeric(train_ts_diff), test_ts_diff)
@@ -718,7 +718,7 @@ n_test  <- length(test_ts_diff)
 
 
 ### Rolling Forecasts for the Main Series and Exogenous Variables
-```{r}
+```{r warning=FALSE}
 # Define the main GARCH specification.
 spec_main <- ugarchspec(
   variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
@@ -740,8 +740,9 @@ spec_exog <- ugarchspec(
 
 # For each exogenous variable, combine training and test series.
 rolling_exog <- lapply(exog_vars, function(var) {
-  series_exog <- winsorize(as.numeric(train_data[[var]]), lower = 0.1, upper = 0.9)
-  combined_exog <- c(series_exog, as.numeric(test_data[[var]]))
+  series_exog <- winsorize(as.numeric(train_data_day[[var]]), 
+                           lower = 0.1, upper = 0.9)
+  combined_exog <- c(series_exog, as.numeric(test_data_day[[var]]))
   rolling_exog_forecast(combined_exog, n_train, n_test, spec_exog)
 })
 names(rolling_exog) <- exog_vars
@@ -752,7 +753,7 @@ names(rolling_exog) <- exog_vars
 ### Fit the Main ARIMAX-GARCH Model (for Returns)
 ```{r}
 # Prepare external regressors for training.
-xreg_train_diff <- as.matrix(train_data %>% select(all_of(exog_vars)))
+xreg_train_diff <- as.matrix(train_data_day %>% select(all_of(exog_vars)))
 
 spec_final <- ugarchspec(
   variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
@@ -769,8 +770,8 @@ ar1   <- coefs["ar1"]
 mxreg <- coefs[grep("mxreg", names(coefs))]
 
 # Last observed return and price level.
-y_last <- tail(train_data$adjusted_diff, 1)
-last_train_level <- tail(train_data$adjusted, 1)
+y_last <- tail(train_data_day$adjusted_diff, 1)
+last_train_level <- tail(train_data_day$adjusted, 1)
 
 # For the exogenous effect in the main model, extract rolling forecasted means.
 # Create a matrix (n_test x n_exog) of exogenous forecast means.
@@ -815,10 +816,10 @@ lower_PI <- apply(price_sim_paths, 1, quantile, probs = 0.025)
 upper_PI <- apply(price_sim_paths, 1, quantile, probs = 0.975)
 
 # Prepare plotting data.
-test_ts_levels <- as.numeric(ts(test_data$adjusted, frequency = 252,
-                                 start = c(1, nrow(train_data) + 1)))
+test_ts_levels <- as.numeric(ts(test_data_day$adjusted, frequency = 252,
+                                 start = c(1, nrow(train_data_day) + 1)))
 df_plot <- tibble(
-  date = test_data$date,
+  date = test_data_day$date,
   actual = test_ts_levels,
   forecast = forecast_price,
   lower_PI = lower_PI,
@@ -841,5 +842,62 @@ cat("Final Rolling Forecast (with exogenous simulation) -> MAPE:", round(mape_fi
     "%, MSE:", round(mse_final, 2), "\n")
 ```
 
+## Convert Daily to Weekly
+```{r}
 
+df_weekly_forecast <- df_plot %>%
+  mutate(week = floor_date(date, unit = "week", week_start = 1)) %>%
+  group_by(week) %>%
+  summarise(
+    actual = last(actual),
+    forecast = last(forecast),
+    lower_PI = last(lower_PI),
+    upper_PI = last(upper_PI)
+  ) %>%
+  ungroup()
+
+# Plot the weekly forecasts
+ggplot(df_weekly_forecast, aes(x = week)) +
+  geom_line(aes(y = actual), color = "black") +
+  geom_line(aes(y = forecast), color = "blue") +
+  geom_ribbon(aes(ymin = lower_PI, ymax = upper_PI), fill = "blue", alpha = 0.2) +
+  labs(title = paste(symbol, "Weekly Forecast via Rolling ARIMAX-GARCH Simulation"),
+       x = "Week", y = "Adjusted Price") +
+  theme_minimal()
+```
+
+
+# Combined Models
+```{r}
+# Combine the forecasts into a tibble/data frame.
+# Make sure that all forecast vectors are aligned and have the same length as test_data.
+combined_forecasts <- tibble(
+  week = df_weekly_forecast$week[-1],
+  ARIMAX   = recovered_forecast_arima,
+  NNETAR   = recovered_forecast_nnet,
+  XGBoost  = pred_xgb,
+  GARCH    = df_weekly_forecast$forecast[-1]
+)
+
+# Calculate the mean forecast across the models.
+combined_forecasts <- combined_forecasts %>%
+  mutate(Mean_Forecast = (ARIMAX + NNETAR + XGBoost + GARCH) / 4)
+
+# Plot the combined forecast vs. the actual adjusted prices.
+ggplot(combined_forecasts, aes(x = week)) +
+  geom_line(aes(y = Mean_Forecast), color = "blue", size = 1) +
+  geom_line(aes(y = test_data_week$adjusted), color = "black", size = 1) +
+  labs(title = paste(symbol, "Combined Forecast (Mean of All Models)"),
+       x = "Date", y = "Adjusted Price") +
+  theme_minimal()
+
+```
+
+## performance
+```{r}
+mape_final <- mean(abs(combined_forecasts$Mean_Forecast - test_tree$adjusted) / abs(test_tree$adjusted)) * 100
+mse_final  <- mean((combined_forecasts$Mean_Forecast - test_tree$adjusted)^2)
+cat("Final Combined Forecast (with exogenous simulation) -> MAPE:", round(mape_final, 2),
+    "%, MSE:", round(mse_final, 2), "\n")
+```
 
